@@ -1,0 +1,15 @@
+# Scan output: logs and reports contain plaintext secrets
+log/
+
+# Cloned / extracted target repositories
+repos/
+
+# Old script versions and backups
+archive/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
