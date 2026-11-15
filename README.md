@@ -17,6 +17,7 @@ Current version: **1.7**
 - [Exit Codes](#exit-codes)
 - [Limitations](#limitations)
 - [Remediation Best Practices](#remediation-best-practices)
+- [License](#license)
 
 ## How it works
 
@@ -226,3 +227,7 @@ When a secret is confirmed:
 4. **Then clean the history** if needed, with a tool such as [`git filter-repo`](https://github.com/newren/git-filter-repo), and coordinate a force-push with everyone who has a clone. On hosted platforms, old commits may remain reachable by ID until the provider purges them.
 5. **Prevent recurrence** with pre-commit hooks or CI secret scanning (Gitleaks or TruffleHog), and `.gitignore` entries for `.env` and key files.
 6. **Handle the evidence securely:** restrict access to `log/`, and delete reports once they are no longer needed.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
