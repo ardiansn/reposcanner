@@ -1,16 +1,18 @@
 import os
 import re
+import json
 import subprocess
 import argparse
 import ipaddress
 import shutil
 import stat
 import sys
+import traceback
 from datetime import datetime
 from urllib.parse import urlsplit
 
 # ==========================================
-# REGEX CONFIGURATION (HYBRID) - VERSION 1.7
+# REGEX CONFIGURATION (HYBRID) - VERSION 1.8
 # ==========================================
 # Lookarounds reject longer version strings (e.g. 1.2.3.4.5); octets are validated via is_exposed_ip()
 REGEX_IP = re.compile(r'(?<![\d.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![\d.])')
@@ -40,6 +42,11 @@ REGEX_SECRETS_DIRECT = re.compile(
 # File extensions skipped during static text scanning
 IGNORE_EXT = ['.png', '.jpg', '.jpeg', '.gif', '.mp4', '.zip', '.tar', '.gz', '.pdf', '.exe', '.dll', '.so']
 
+# Exit codes (only used when --fail-on-findings / --strict are set; otherwise the script exits 0)
+EXIT_OK = 0
+EXIT_FINDINGS = 1
+EXIT_OPERATIONAL_ERROR = 3
+
 class DualLogger(object):
     """Duplicates terminal output into a log file."""
     def __init__(self, filename):
@@ -53,6 +60,16 @@ class DualLogger(object):
     def flush(self):
         self.terminal.flush()
         self.log.flush()
+
+class ScanStatus(object):
+    """Counts secret findings and operational errors so the exit code can reflect them."""
+    def __init__(self):
+        self.findings = 0
+        self.errors = 0
+
+    def error(self, message):
+        print(message)
+        self.errors += 1
 
 def is_exposed_ip(ip):
     """True if the IP is valid (each octet 0-255) and is not loopback / 0.0.0.0."""
@@ -69,7 +86,7 @@ def is_git_repo(path):
     # .git can be a file (worktrees, submodules), so only check that it exists
     return os.path.exists(os.path.join(path, '.git'))
 
-def run_gitleaks(repo_path, repo_name, timestamp):
+def run_gitleaks(repo_path, repo_name, timestamp, output_dir, status):
     if not check_binary("gitleaks"):
         print("  [-] Binary 'gitleaks' not found on the system. Skipping Gitleaks scan.")
         return
@@ -78,8 +95,7 @@ def run_gitleaks(repo_path, repo_name, timestamp):
     git_mode = is_git_repo(repo_path)
     print(f"  [*] Running Gitleaks ({'git history' if git_mode else 'filesystem'} mode)...")
     report_filename = f"gitleaks-report-{repo_name}-{timestamp}.json"
-    # Write the report into the log/ folder
-    report_path = os.path.join(os.getcwd(), "log", report_filename)
+    report_path = os.path.join(output_dir, report_filename)
 
     cmd = [
         "gitleaks", "detect",
@@ -88,21 +104,25 @@ def run_gitleaks(repo_path, repo_name, timestamp):
         "--report-format", "json",
         "--report-path", report_path
     ]
-    
+
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         # gitleaks also uses exit 1 for fatal errors; the report is only written if the scan completes
-        report_written = os.path.exists(report_path)
-        if result.returncode == 0 and report_written:
-            print(f"  [+] Gitleaks finished, no findings. Report saved to: {report_path}")
-        elif result.returncode == 1 and report_written:
-            print(f"  [+] Gitleaks finished, FINDINGS DETECTED. Report saved to: {report_path}")
+        if result.returncode not in (0, 1) or not os.path.exists(report_path):
+            status.error(f"  [!] Gitleaks error (exit {result.returncode}): {result.stderr.strip()}")
+            return
+        # The JSON report is a list with one entry per finding ("[]" when clean)
+        with open(report_path, encoding="utf-8") as report_file:
+            count = len(json.load(report_file))
+        if count:
+            status.findings += count
+            print(f"  [+] Gitleaks finished, FINDINGS DETECTED ({count}). Report saved to: {report_path}")
         else:
-            print(f"  [!] Gitleaks error (exit {result.returncode}): {result.stderr.strip()}")
-    except Exception as e:
-        print(f"  [!] Failed to run Gitleaks: {e}")
+            print(f"  [+] Gitleaks finished, no findings. Report saved to: {report_path}")
+    except (OSError, ValueError) as e:
+        status.error(f"  [!] Failed to run Gitleaks or read its report: {e}")
 
-def run_trufflehog(repo_path, repo_name, timestamp):
+def run_trufflehog(repo_path, repo_name, timestamp, output_dir, status):
     if not check_binary("trufflehog"):
         print("  [-] Binary 'trufflehog' not found on the system. Skipping TruffleHog scan.")
         return
@@ -110,8 +130,7 @@ def run_trufflehog(repo_path, repo_name, timestamp):
     git_mode = is_git_repo(repo_path)
     print(f"  [*] Running TruffleHog ({'git history' if git_mode else 'filesystem'} mode)...")
     report_filename = f"trufflehog-report-{repo_name}-{timestamp}.json"
-    # Write the report into the log/ folder
-    report_path = os.path.join(os.getcwd(), "log", report_filename)
+    report_path = os.path.join(output_dir, report_filename)
     abs_repo_path = os.path.abspath(repo_path)
 
     # No shell: arguments are passed as a list so the repo name cannot be used for command injection
@@ -123,33 +142,36 @@ def run_trufflehog(repo_path, repo_name, timestamp):
     try:
         with open(report_path, "w", encoding="utf-8") as report_file:
             result = subprocess.run(cmd, stdout=report_file, stderr=subprocess.PIPE, text=True)
-        has_findings = os.path.getsize(report_path) > 0
+        # JSON Lines: one finding per non-empty line
+        with open(report_path, encoding="utf-8") as report_file:
+            count = sum(1 for line in report_file if line.strip())
+        status.findings += count
         if result.returncode != 0:
-            print(f"  [!] TruffleHog error (exit {result.returncode}): {result.stderr.strip()}")
-            if has_findings:
+            status.error(f"  [!] TruffleHog error (exit {result.returncode}): {result.stderr.strip()}")
+            if count:
                 print(f"  [!] Partial report (incomplete scan) saved to: {report_path}")
             else:
                 os.remove(report_path)
-        elif has_findings:
-            print(f"  [+] TruffleHog finished, FINDINGS DETECTED. Report saved to: {report_path}")
+        elif count:
+            print(f"  [+] TruffleHog finished, FINDINGS DETECTED ({count}). Report saved to: {report_path}")
         else:
             os.remove(report_path)
             print("  [+] TruffleHog finished, no findings.")
-    except Exception as e:
-        print(f"  [!] Failed to run TruffleHog: {e}")
+    except OSError as e:
+        status.error(f"  [!] Failed to run TruffleHog: {e}")
 
-def scan_file(filepath):
+def scan_file(filepath, status):
     findings = {
         'ips': set(),
         'emails': set(),
         'secrets': []
     }
-    
+
     # Skip symlinks and non-regular files (FIFO, device) to avoid reading host files or hanging
     try:
         st = os.lstat(filepath)
     except OSError as e:
-        print(f"[!] Error reading file {filepath}: {e}")
+        status.error(f"[!] Error reading file {filepath}: {e}")
         return findings
     if not stat.S_ISREG(st.st_mode):
         return findings
@@ -176,60 +198,68 @@ def scan_file(filepath):
                     raw_line = line.strip()
                     display_line = raw_line if len(raw_line) <= 120 else raw_line[:120] + "...[TRUNCATED]"
                     findings['secrets'].append(f"Line {line_no} [PATTERN]: {display_line}")
-                    
+
     except Exception as e:
-        print(f"[!] Error reading file {filepath}: {e}")
-        
+        status.error(f"[!] Error reading file {filepath}: {e}")
+
     return findings
 
-def get_git_authors(repo_path):
+def get_git_authors(repo_path, status):
     if not is_git_repo(repo_path):
         return ["[!] Not a Git repository or .git folder not found."]
-    
+
     try:
         result = subprocess.run(
-            ['git', 'log', '--format=%aN | %aE'], 
+            ['git', 'log', '--format=%aN | %aE'],
             cwd=repo_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
         if result.returncode == 0:
             authors = set(result.stdout.strip().split('\n'))
             return list(authors)
         else:
+            status.errors += 1
             return [f"[!] Failed to run Git: {result.stderr.strip()}"]
     except Exception as e:
+        status.errors += 1
         return [f"[!] Git is not installed or returned an error: {e}"]
 
-def main(directory, repo_name, timestamp):
-    print(f"\n=== SOC REPOSITORY TRIAGE SCANNER V1.7 ===")
+def main(directory, repo_name, timestamp, output_dir, status):
+    print(f"\n=== SOC REPOSITORY TRIAGE SCANNER V1.8 ===")
     print(f"Target Directory: {directory}")
     print(f"Session ID: {repo_name}-{timestamp}\n")
-    
+
     all_ips = set()
     all_emails = set()
     all_secrets = []
-    
+
     print("[*] Starting basic text scan (Fast Scan)...")
-    for root, dirs, files in os.walk(directory):
+    # Unreadable subfolders count as operational errors instead of being skipped silently
+    walk_errors = lambda e: status.error(f"[!] Cannot read directory {e.filename}: {e.strerror}")
+    real_output_dir = os.path.realpath(output_dir)
+    for root, dirs, files in os.walk(directory, onerror=walk_errors):
         if '.git' in dirs:
             dirs.remove('.git')
-            
+        # Do not scan our own logs/reports when the output folder is inside the target
+        dirs[:] = [d for d in dirs if os.path.realpath(os.path.join(root, d)) != real_output_dir]
+
         for file in files:
             if any(file.lower().endswith(ext) for ext in IGNORE_EXT):
                 continue
             filepath = os.path.join(root, file)
-            result = scan_file(filepath)
+            result = scan_file(filepath, status)
             all_ips.update(result['ips'])
             all_emails.update(result['emails'])
             for sec in result['secrets']:
                 all_secrets.append(f"[{file}] {sec}")
+    status.findings += len(all_secrets)
 
     print("[*] Extracting Git metadata (Author Analysis)...")
-    authors = get_git_authors(directory)
+    authors = get_git_authors(directory, status)
 
     print("\n" + "="*40)
     print("CODE FORENSIC ANALYSIS RESULTS")
     print("="*40)
-    
+
     print("\n[1] BASIC SECRETS SEARCH (HYBRID REGEX):")
     if all_secrets:
         for s in all_secrets:
@@ -256,38 +286,47 @@ def main(directory, repo_name, timestamp):
     print("\n[4] ACTOR ANALYSIS (GIT AUTHORS):")
     for author in authors:
         print(f"  - {author}")
-        
+
     print("\n[5] ADVANCED SCAN (GITLEAKS & TRUFFLEHOG):")
-    run_gitleaks(directory, repo_name, timestamp)
-    run_trufflehog(directory, repo_name, timestamp)
-    
+    run_gitleaks(directory, repo_name, timestamp, output_dir, status)
+    run_trufflehog(directory, repo_name, timestamp, output_dir, status)
+
     print("="*40)
 
-def setup_logging(repo_name):
-    """Creates the session timestamp and duplicates stdout into log/. Returns the timestamp."""
+def setup_logging(repo_name, output_dir, status):
+    """Creates the session timestamp and duplicates stdout into output_dir. Returns the timestamp, or None on failure."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    os.makedirs("log", exist_ok=True)
-    log_filepath = os.path.join("log", f"soc_repo_scanner-{repo_name}-{timestamp}.log")
-    sys.stdout = DualLogger(log_filepath)
+    log_filepath = os.path.join(output_dir, f"soc_repo_scanner-{repo_name}-{timestamp}.log")
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        sys.stdout = DualLogger(log_filepath)
+    except OSError as e:
+        status.error(f"[-] CRITICAL ERROR: Cannot write to output directory '{output_dir}': {e}")
+        return None
     return timestamp
 
-def setup_local(local_path):
+def setup_local(local_path, output_dir, status):
     """Scans a local folder in place (no clone), including uncommitted and untracked files."""
     target_dir = os.path.abspath(os.path.expanduser(local_path))
     if not os.path.isdir(target_dir):
-        print(f"[-] CRITICAL ERROR: Local folder not found: '{local_path}'")
+        status.error(f"[-] CRITICAL ERROR: Local folder not found: '{local_path}'")
+        return
+    if not os.access(target_dir, os.R_OK | os.X_OK):
+        status.error(f"[-] CRITICAL ERROR: Local folder is not readable: '{local_path}'")
         return
 
     # The folder name is only used for log/report file names, so replace unsafe characters
     folder_name = re.sub(r'[^A-Za-z0-9._-]', '_', os.path.basename(target_dir)) or 'root'
     repo_name = f"local_{folder_name}"
 
-    timestamp = setup_logging(repo_name)
+    timestamp = setup_logging(repo_name, output_dir, status)
+    if timestamp is None:
+        return
     print(f"[*] Local mode: scanning '{target_dir}' in place "
           f"({'Git repository' if is_git_repo(target_dir) else 'not a Git repository'}).")
-    main(target_dir, repo_name, timestamp)
+    main(target_dir, repo_name, timestamp, output_dir, status)
 
-def setup_and_clone(repo_url):
+def setup_and_clone(repo_url, output_dir, status):
     """Sets up logging and the 'repos' directory, runs git clone, and starts the scan."""
     # Extract the owner/org and repository name from the URL (without query string / fragment)
     path_parts = [p for p in urlsplit(repo_url).path.split('/') if p]
@@ -299,10 +338,10 @@ def setup_and_clone(repo_url):
     # Validate names so they cannot escape the repos/ folder (e.g. '..')
     for part in (owner, repo_name):
         if part and (not re.fullmatch(r'[A-Za-z0-9._-]+', part) or part in ('.', '..')):
-            print(f"[-] CRITICAL ERROR: Invalid repository name: '{part}'")
+            status.error(f"[-] CRITICAL ERROR: Invalid repository name: '{part}'")
             return
     if not repo_name:
-        print(f"[-] CRITICAL ERROR: Repository name not found in URL: '{repo_url}'")
+        status.error(f"[-] CRITICAL ERROR: Repository name not found in URL: '{repo_url}'")
         return
 
     # Include the owner so orgA/app and orgB/app do not share the same folder
@@ -310,13 +349,19 @@ def setup_and_clone(repo_url):
         repo_name = f"{owner}_{repo_name}"
 
     # 1. Setup Logging
-    timestamp = setup_logging(repo_name)
+    timestamp = setup_logging(repo_name, output_dir, status)
+    if timestamp is None:
+        return
 
     # 2. Set up the target repository
     base_dir = "repos"
-    os.makedirs(base_dir, exist_ok=True)
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+    except OSError as e:
+        status.error(f"[-] CRITICAL ERROR: Cannot create '{base_dir}' directory: {e}")
+        return
     target_dir = os.path.join(base_dir, repo_name)
-    
+
     # 3. Run Git Clone
     if os.path.exists(target_dir):
         # Make sure the existing folder is a clone of the same URL before reusing it
@@ -326,8 +371,8 @@ def setup_and_clone(repo_url):
         )
         existing_url = remote.stdout.strip()
         if remote.returncode != 0 or existing_url.rstrip('/') != repo_url.rstrip('/'):
-            print(f"[-] CRITICAL ERROR: Directory '{target_dir}' already exists but is not a clone of {repo_url} "
-                  f"(origin: '{existing_url or 'none'}'). Remove/move that folder and run again.")
+            status.error(f"[-] CRITICAL ERROR: Directory '{target_dir}' already exists but is not a clone of {repo_url} "
+                         f"(origin: '{existing_url or 'none'}'). Remove/move that folder and run again.")
             return
         print(f"[*] Directory '{target_dir}' already exists. Updating clone (git pull --ff-only)...")
         pull = subprocess.run(
@@ -335,35 +380,61 @@ def setup_and_clone(repo_url):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
         if pull.returncode != 0:
-            print(f"[!] Failed to update clone, scanning the existing copy: {pull.stderr.strip()}")
+            status.error(f"[!] Failed to update clone, scanning the existing copy: {pull.stderr.strip()}")
     else:
         print(f"[*] Cloning repository from {repo_url} into '{target_dir}'...")
         if not check_binary("git"):
-            print("[-] CRITICAL ERROR: 'git' not found on the system. Please install git first.")
+            status.error("[-] CRITICAL ERROR: 'git' not found on the system. Please install git first.")
             return
-            
+
         try:
             # '--' prevents a URL starting with '-' from being parsed as a git option
             result = subprocess.run(["git", "clone", "--", repo_url, target_dir], capture_output=True, text=True)
             if result.returncode != 0:
-                print(f"[-] git clone failed: {result.stderr.strip()}")
+                status.error(f"[-] git clone failed: {result.stderr.strip()}")
                 return
             print("[+] Git clone succeeded.")
         except Exception as e:
-            print(f"[-] An error occurred while running git clone: {e}")
+            status.error(f"[-] An error occurred while running git clone: {e}")
             return
 
     # Proceed to scan the cloned directory
-    main(target_dir, repo_name, timestamp)
+    main(target_dir, repo_name, timestamp, output_dir, status)
+
+def exit_code(status, fail_on_findings, strict):
+    """Operational errors (--strict) take precedence over findings (--fail-on-findings)."""
+    if strict and status.errors:
+        return EXIT_OPERATIONAL_ERROR
+    if fail_on_findings and status.findings:
+        return EXIT_FINDINGS
+    return EXIT_OK
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="SOC Triage Script for Leaked Repositories (Version 1.7)")
+    parser = argparse.ArgumentParser(description="SOC Triage Script for Leaked Repositories (Version 1.8)")
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("url", nargs="?", help="Repository URL (example: https://github.com/org/repo)")
     target.add_argument("--local", metavar="PATH", help="Scan a local folder in place, without cloning (any path)")
+    parser.add_argument("--output-dir", metavar="DIR", default="log",
+                        help="Directory for the log file and scanner reports (default: ./log)")
+    parser.add_argument("--fail-on-findings", action="store_true",
+                        help="Exit with code 1 if any secret is found (built-in regex, Gitleaks or TruffleHog)")
+    parser.add_argument("--strict", action="store_true",
+                        help="Exit with code 3 on operational errors (clone, path, output, scanner failures)")
     args = parser.parse_args()
 
-    if args.local:
-        setup_local(args.local)
-    else:
-        setup_and_clone(args.url)
+    output_dir = os.path.abspath(os.path.expanduser(args.output_dir))
+    status = ScanStatus()
+    try:
+        if args.local:
+            setup_local(args.local, output_dir, status)
+        else:
+            setup_and_clone(args.url, output_dir, status)
+    except Exception:
+        traceback.print_exc()
+        sys.stdout.flush()
+        # An unexpected crash is an operational error; without --strict keep Python's usual exit code 1
+        sys.exit(EXIT_OPERATIONAL_ERROR if args.strict else 1)
+
+    print(f"[*] Summary: {status.findings} secret finding(s), {status.errors} operational error(s).")
+    sys.stdout.flush()
+    sys.exit(exit_code(status, args.fail_on_findings, args.strict))
