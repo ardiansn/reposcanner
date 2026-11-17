@@ -1,11 +1,13 @@
-"""End-to-end tests for soc_repo_scanner.py (standard library only).
+"""Tests for soc_repo_scanner.py (standard library only).
 
-Each test runs the script as a subprocess inside a TemporaryDirectory, so nothing is
-left behind. PATH is limited to a private bin folder holding only `git` and, when a
-test needs one, a fake `gitleaks`, so results do not depend on the scanners
-installed on the machine.
+Each CLI test runs the script as a subprocess inside a TemporaryDirectory, so nothing
+is left behind. PATH is limited to a private bin folder holding only `git` and, when a
+test needs them, fake `gitleaks` / `trufflehog` scripts, so results do not depend on
+the scanners installed on the machine.
 """
 import glob
+import importlib.util
+import json
 import os
 import shutil
 import stat
@@ -16,16 +18,24 @@ import unittest
 
 SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "soc_repo_scanner.py")
 
-# Synthetic secret, built at runtime so the source never contains a real-looking token
+# Synthetic secrets, built at runtime so the source never contains a real-looking token
 SYNTHETIC_SECRET_VALUE = "dummy_test_" + "secret_999"
 SYNTHETIC_SECRET_LINE = "api_key = '" + SYNTHETIC_SECRET_VALUE + "'\n"
+OTHER_SECRET_VALUE = "other_test_" + "value_12345"
+OTHER_SECRET_LINE = "password = '" + OTHER_SECRET_VALUE + "'\n"
+FIXTURE_FILE = os.path.join("fixtures", "sample.txt")
 
-# Fake gitleaks: writes a report with one finding, or fails without writing one
+# Fake gitleaks: reports one finding in <source>/fixtures/sample.txt, or fails without a report
 FAKE_GITLEAKS_FINDING = """
-import json, sys
+import json, os, sys
 report = sys.argv[sys.argv.index("--report-path") + 1]
+source = sys.argv[sys.argv.index("--source") + 1]
+secret = "dummy_test_" + "secret_999"
+finding = {"RuleID": "generic-api-key", "File": os.path.join(source, "fixtures", "sample.txt"),
+           "StartLine": 7, "Commit": "", "Match": "api_key = " + secret, "Secret": secret,
+           "Line": "    api_key = " + secret + "  # copied by some versions"}
 with open(report, "w") as f:
-    json.dump([{"RuleID": "generic-api-key", "File": "synthetic.txt"}], f)
+    json.dump([finding], f)
 sys.exit(1)
 """
 FAKE_GITLEAKS_FAILURE = """
@@ -33,6 +43,25 @@ import sys
 sys.stderr.write("synthetic gitleaks failure\\n")
 sys.exit(2)
 """
+# Fake trufflehog (filesystem mode): one JSON line for <path>/fixtures/sample.txt. Like real
+# versions, it also copies the secret into SecretParts and ExtraData.
+FAKE_TRUFFLEHOG_FINDING = """
+import json, os, sys
+path = sys.argv[2]
+secret = "dummy_test_" + "secret_999"
+print(json.dumps({"DetectorName": "Generic", "Raw": secret, "RawV2": secret + ":extra",
+                  "SecretParts": {"key": secret}, "ExtraData": {"note": "seen " + secret},
+                  "SourceMetadata": {"Data": {"Filesystem": {"file": os.path.join(path, "fixtures", "sample.txt"), "line": 7}}}}))
+"""
+
+
+def load_scanner_module():
+    """Imports the script for unit tests without writing __pycache__ next to it."""
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location("soc_repo_scanner", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class ScannerCliTest(unittest.TestCase):
@@ -52,9 +81,17 @@ class ScannerCliTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def write_target(self, content):
-        with open(os.path.join(self.target, "config.txt"), "w", encoding="utf-8") as f:
+    def write_target(self, content, name="config.txt"):
+        path = os.path.join(self.target, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
             f.write(content)
+
+    def read_single(self, pattern):
+        matches = glob.glob(pattern)
+        self.assertEqual(len(matches), 1, f"expected one file matching {pattern}, found {matches}")
+        with open(matches[0], encoding="utf-8") as f:
+            return f.read()
 
     def add_fake_tool(self, name, body):
         path = os.path.join(self.bin, name)
@@ -164,6 +201,153 @@ class ScannerCliTest(unittest.TestCase):
             f.write(SYNTHETIC_SECRET_LINE)
         result = self.run_scanner("--local", self.target, "--output-dir", out, "--fail-on-findings")
         self.assert_exit(result, 0)
+
+    # v1.9: allowlisting (.reposcannerignore / --ignore-file)
+
+    def test_ignore_path_glob_suppresses_findings(self):
+        self.write_target(SYNTHETIC_SECRET_LINE, name=FIXTURE_FILE)
+        self.write_target("# test fixtures\n\nfixtures/*\n", name=".reposcannerignore")
+        result = self.run_scanner("--local", self.target, "--fail-on-findings")
+        self.assert_exit(result, 0)
+        self.assertIn("0 secret finding(s) (1 ignored)", result.stdout)
+
+    def test_ignore_regex_suppresses_only_matching_findings(self):
+        self.write_target(SYNTHETIC_SECRET_LINE, name="a.txt")
+        self.write_target(OTHER_SECRET_LINE, name="b.txt")
+        self.write_target("regex:^dummy_test_\n", name=".reposcannerignore")
+        result = self.run_scanner("--local", self.target, "--fail-on-findings")
+        self.assert_exit(result, 1)
+        self.assertIn("1 secret finding(s) (1 ignored)", result.stdout)
+        self.assertIn(OTHER_SECRET_VALUE, result.stdout)
+        self.assertNotIn(SYNTHETIC_SECRET_VALUE, result.stdout)
+
+    def test_ignore_file_option_replaces_target_file(self):
+        self.write_target(SYNTHETIC_SECRET_LINE)
+        self.write_target("path:*\n", name=".reposcannerignore")
+        custom = os.path.join(self.tmp, "empty-rules")
+        with open(custom, "w", encoding="utf-8") as f:
+            f.write("# no rules\n")
+        result = self.run_scanner("--local", self.target, "--ignore-file", custom, "--fail-on-findings")
+        self.assert_exit(result, 1)
+
+    def test_strict_missing_ignore_file_exits_3(self):
+        self.write_target("nothing sensitive here\n")
+        result = self.run_scanner("--local", self.target, "--strict",
+                                  "--ignore-file", os.path.join(self.tmp, "missing-rules"))
+        self.assert_exit(result, 3)
+
+    def test_strict_invalid_regex_rule_exits_3(self):
+        self.write_target("nothing sensitive here\n")
+        self.write_target("regex:[unclosed\n", name=".reposcannerignore")
+        result = self.run_scanner("--local", self.target, "--strict")
+        self.assert_exit(result, 3)
+        self.assertIn("Invalid regex on line 1", result.stdout)
+
+    def test_ignore_rules_apply_to_gitleaks_results(self):
+        self.write_target("nothing sensitive here\n")
+        self.write_target("path:fixtures/*\n", name=".reposcannerignore")
+        self.add_fake_tool("gitleaks", FAKE_GITLEAKS_FINDING)
+        result = self.run_scanner("--local", self.target, "--fail-on-findings")
+        self.assert_exit(result, 0)
+        self.assertIn("Gitleaks finished, no findings (1 ignored)", result.stdout)
+
+    def test_ignore_rules_apply_to_trufflehog_results(self):
+        self.write_target("nothing sensitive here\n")
+        self.write_target("regex:^dummy_test_\n", name=".reposcannerignore")
+        self.add_fake_tool("trufflehog", FAKE_TRUFFLEHOG_FINDING)
+        result = self.run_scanner("--local", self.target, "--fail-on-findings")
+        self.assert_exit(result, 0)
+        self.assertIn("TruffleHog finished, no findings (1 ignored)", result.stdout)
+
+    def make_git_repo_with_ignore_file(self):
+        """Commits a synthetic secret plus a .reposcannerignore that allowlists it; returns a file:// URL."""
+        self.write_target(SYNTHETIC_SECRET_LINE)
+        self.write_target("regex:^dummy_test_\n", name=".reposcannerignore")
+        git = ["git", "-C", self.target, "-c", "user.name=Test", "-c", "user.email=test@example.com"]
+        for cmd in (["init", "-q"], ["add", "."], ["commit", "-q", "-m", "synthetic fixture"]):
+            subprocess.run(git + cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return "file://" + self.target
+
+    @unittest.skipUnless(shutil.which("git"), "git is required for URL mode")
+    def test_url_mode_skips_target_ignore_file_by_default(self):
+        url = self.make_git_repo_with_ignore_file()
+        result = self.run_scanner(url, "--fail-on-findings")
+        self.assert_exit(result, 1)
+        self.assertIn("Skipping target .reposcannerignore in URL mode", result.stdout)
+        self.assertIn(SYNTHETIC_SECRET_VALUE, result.stdout)
+
+    @unittest.skipUnless(shutil.which("git"), "git is required for URL mode")
+    def test_url_mode_trust_target_ignore_applies_rules(self):
+        url = self.make_git_repo_with_ignore_file()
+        result = self.run_scanner(url, "--fail-on-findings", "--trust-target-ignore")
+        self.assert_exit(result, 0)
+        self.assertIn("0 secret finding(s) (1 ignored)", result.stdout)
+
+    # v1.9: --redact
+
+    def test_redact_masks_report_and_scanner_sidecars(self):
+        self.write_target(SYNTHETIC_SECRET_LINE)
+        self.add_fake_tool("gitleaks", FAKE_GITLEAKS_FINDING)
+        self.add_fake_tool("trufflehog", FAKE_TRUFFLEHOG_FINDING)
+        out = os.path.join(self.tmp, "out")
+        result = self.run_scanner("--local", self.target, "--redact", "--output-dir", out)
+        self.assert_exit(result, 0)
+        masked = SYNTHETIC_SECRET_VALUE[:4] + "****" + SYNTHETIC_SECRET_VALUE[-4:]
+
+        log = self.read_single(os.path.join(out, "soc_repo_scanner-*.log"))
+        self.assertNotIn(SYNTHETIC_SECRET_VALUE, log)
+        self.assertIn(f"[config.txt] Line 1 [KV]: api_key = {masked}", log)
+
+        gitleaks = json.loads(self.read_single(os.path.join(out, "gitleaks-report-*.json")))[0]
+        self.assertEqual(gitleaks["Secret"], masked)
+        self.assertNotIn(SYNTHETIC_SECRET_VALUE, gitleaks["Match"])
+        self.assertTrue(gitleaks["File"].endswith(FIXTURE_FILE))
+        self.assertEqual((gitleaks["StartLine"], gitleaks["RuleID"]), (7, "generic-api-key"))
+
+        trufflehog = json.loads(self.read_single(os.path.join(out, "trufflehog-report-*.json")))
+        self.assertEqual(trufflehog["Raw"], masked)
+        self.assertEqual(trufflehog["SecretParts"]["key"], masked)
+        self.assertNotIn(SYNTHETIC_SECRET_VALUE, trufflehog["RawV2"])
+        self.assertTrue(trufflehog["SourceMetadata"]["Data"]["Filesystem"]["file"].endswith(FIXTURE_FILE))
+        self.assertEqual(trufflehog["SourceMetadata"]["Data"]["Filesystem"]["line"], 7)
+
+        for path in glob.glob(os.path.join(out, "*")):
+            with open(path, encoding="utf-8") as f:
+                self.assertNotIn(SYNTHETIC_SECRET_VALUE, f.read(), path)
+
+    def test_default_run_keeps_plaintext_values(self):
+        self.write_target(SYNTHETIC_SECRET_LINE)
+        self.add_fake_tool("gitleaks", FAKE_GITLEAKS_FINDING)
+        out = os.path.join(self.tmp, "out")
+        result = self.run_scanner("--local", self.target, "--output-dir", out)
+        self.assert_exit(result, 0)
+        log = self.read_single(os.path.join(out, "soc_repo_scanner-*.log"))
+        self.assertIn(f"[config.txt] Line 1 [KV]: api_key = {SYNTHETIC_SECRET_VALUE}", log)
+        gitleaks = json.loads(self.read_single(os.path.join(out, "gitleaks-report-*.json")))[0]
+        self.assertEqual(gitleaks["Secret"], SYNTHETIC_SECRET_VALUE)
+
+
+class MaskingTest(unittest.TestCase):
+    """Unit tests for the masking helpers."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scanner = load_scanner_module()
+
+    def test_mask_secret_long_value_keeps_first_and_last_four(self):
+        self.assertEqual(self.scanner.mask_secret("abcdefghiwxyz"), "abcd****wxyz")
+        self.assertEqual(self.scanner.mask_secret("123456789"), "1234****6789")
+
+    def test_mask_secret_short_value_fully_hidden(self):
+        self.assertEqual(self.scanner.mask_secret("12345678"), "********")
+        self.assertEqual(self.scanner.mask_secret("ab"), "********")
+
+    def test_mask_spans_merges_overlapping_secrets(self):
+        line = "key=" + OTHER_SECRET_VALUE + " end"
+        start = line.index(OTHER_SECRET_VALUE)
+        span = (start, start + len(OTHER_SECRET_VALUE))
+        masked = self.scanner.mask_spans(line, [span, (start + 2, span[1])])
+        self.assertEqual(masked, "key=" + self.scanner.mask_secret(OTHER_SECRET_VALUE) + " end")
 
 
 if __name__ == "__main__":
