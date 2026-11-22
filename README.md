@@ -2,7 +2,7 @@
 
 A single-file Python tool for quickly triaging a Git repository or local folder that may have exposed **secrets, API keys, tokens and credentials**. It combines a fast built-in regex scan of the files on disk with optional deep scans of the full commit history by [Gitleaks](https://github.com/gitleaks/gitleaks) and [TruffleHog](https://github.com/trufflesecurity/trufflehog), and adds context useful for an investigation: exposed IP addresses, email addresses and Git commit authors.
 
-Current version: **1.9**
+Current version: **1.10**
 
 > **Defensive use only.** This tool is intended for Blue Team, SOC, DevSecOps and authorized repository-hygiene work: finding and responding to credential leaks in repositories you own or are authorized to assess. See [Authorized Use & Disclaimer](#authorized-use--disclaimer).
 
@@ -58,7 +58,13 @@ The software is provided "as is", without warranty of any kind. A clean scan doe
   - AWS access key IDs (`AKIA…` / `ASIA…`)
   - GitHub personal access tokens (`ghp_…`)
   - GitLab personal access tokens (`glpat-…`)
-- **Exposed IP addresses:** valid IPv4 addresses, excluding loopback and `0.0.0.0`; version strings like `1.2.3.4.5` are ignored.
+- **Exposed IP addresses (IPv4 and IPv6):** every candidate is validated with Python's `ipaddress` module, so strings like `999.999.999.999`, `12:34:56` or MAC addresses are dropped. IPv4 octets with a leading zero (`010.0.0.1`) are rejected on every Python version.
+  - Only loopback (`127.0.0.0/8`, `::1`) and unspecified (`0.0.0.0`, `::`) addresses are excluded. Private, link-local (`fe80::/10`), unique local (`fc00::/7`), multicast and documentation ranges (`192.0.2.0/24`, `2001:db8::/32`, …) are reported as infrastructure context.
+  - IPv4 is not matched inside longer dotted numbers or after a letter (`1.2.3.4.5`, `1.3.6.1.4.1`, `v1.2.3.4`); a trailing full stop is allowed (`Server is 10.0.0.1.`).
+  - IPv6 needs either `::` or all 8 groups and must not be attached to a word, so scope operators like `Foo::abc` are skipped.
+  - A zone ID is dropped: `fe80::1%eth0` is reported as `fe80::1`.
+  - IPv4-mapped IPv6 is reported once, as its IPv4 address: `::ffff:8.8.8.8` is listed as `8.8.8.8`.
+  - IPv6 addresses are printed in canonical compressed form (`2001:0db8:0000::0001` → `2001:db8::1`). The list is sorted with IPv4 first, then IPv6.
 - **Email addresses (PII):** credentials inside URLs (`scheme://user:pass@host`) are stripped first so they are not reported as emails.
 - **Safe file handling:** symbolic links and special files are skipped, as are the `.git` folder and binary/media files with these extensions: `.png .jpg .jpeg .gif .mp4 .zip .tar .gz .pdf .exe .dll .so`.
 
@@ -368,11 +374,12 @@ A scanner that is not installed is skipped and does **not** count as an error, s
 - Some connection strings (such as `postgres://` and `mysql://`) and many vendor token formats are not matched by the built-in regex. Gitleaks and TruffleHog cover far more formats.
 - Gitleaks and TruffleHog scan only the history; uncommitted and untracked files in a Git repository are checked only by the built-in regex scan.
 - If the output folder is inside the scanned folder, the built-in scan skips it, but Gitleaks and TruffleHog in filesystem mode (non-Git folders) may scan earlier reports there. Use an output folder outside the target, especially with `--fail-on-findings`.
+- Some hex strings are valid IPv6 syntax and may appear in the IP list: 8-group values such as EUI-64 identifiers or hex dumps (`de:ad:be:ef:00:11:22:33`), and scope pairs made only of the letters a–f and digits (`abc::def`).
 - `--redact` masks secret values only. Paths, IP addresses, email addresses and Git authors are kept, so a redacted report still contains personal data and infrastructure details.
 
 ## Running Tests
 
-The test suite uses only the Python standard library. It covers the CLI flags, exit codes, allowlisting and redaction, plus unit tests for the masking helpers. Each CLI test runs the scanner in a temporary folder that is removed afterwards. Gitleaks and TruffleHog are replaced by small fakes, so the results do not depend on what is installed. All test secrets are synthetic and built at runtime.
+The test suite uses only the Python standard library. It covers the CLI flags, exit codes, allowlisting and redaction, plus unit tests for the masking helpers and for IPv4/IPv6 detection. Each CLI test runs the scanner in a temporary folder that is removed afterwards. Gitleaks and TruffleHog are replaced by small fakes, so the results do not depend on what is installed. All test secrets are synthetic and built at runtime.
 
 ```bash
 python3 -m unittest discover -s tests -v

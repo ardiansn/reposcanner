@@ -13,10 +13,18 @@ from datetime import datetime
 from urllib.parse import urlsplit
 
 # ==========================================
-# REGEX CONFIGURATION (HYBRID) - VERSION 1.9
+# REGEX CONFIGURATION (HYBRID) - VERSION 1.10
 # ==========================================
-# Lookarounds reject longer version strings (e.g. 1.2.3.4.5); octets are validated via is_exposed_ip()
-REGEX_IP = re.compile(r'(?<![\d.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![\d.])')
+# IPv4: nothing word-like or a dot before it (rejects v1.2.3.4, 1.2.3.4.5, 1.3.6.1.4.1); a trailing full stop is allowed
+REGEX_IPV4 = re.compile(r'(?<![A-Za-z0-9_.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?!\d|\.\d)')
+# IPv6 candidates: colon-separated hex groups with an optional embedded IPv4 tail and %zone suffix.
+# Not glued to a word, colon or dot, so Foo::abc and slices of longer runs are skipped.
+# The regex only finds candidates; extract_ips() requires '::' or 8 groups and ipaddress decides validity.
+REGEX_IPV6 = re.compile(
+    r'(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}'
+    r'(?:(?:[0-9]{1,3}\.){3}[0-9]{1,3}|[0-9A-Fa-f]{1,4})?'
+    r'(?:%[0-9A-Za-z_]+(?:[.-][0-9A-Za-z_]+)*)?'
+    r'(?![\w:]|\.\w)')
 REGEX_EMAIL = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 REGEX_URL_USERINFO = re.compile(r'://[^/\s@]*@')
 
@@ -156,13 +164,55 @@ def to_relpath(path, root):
         return os.path.relpath(path, os.path.abspath(root))
     return path
 
-def is_exposed_ip(ip):
-    """True if the IP is valid (each octet 0-255) and is not loopback / 0.0.0.0."""
+def parse_ip(text):
+    """Returns the ipaddress object for text, or None if it is not a valid IPv4/IPv6 address.
+    A %zone suffix (fe80::1%eth0) is dropped first because Python < 3.9 cannot parse it.
+    IPv4-mapped IPv6 (::ffff:8.8.8.8) becomes its IPv4 address, so it is reported once and
+    prints the same on every Python version.
+    Dotted octets with a leading zero (010.0.0.1) are rejected explicitly: some Python 3.7/3.8
+    releases accept them, newer ones do not."""
+    core = text.split('%', 1)[0]
+    dotted = core.rsplit(':', 1)[-1]
+    if '.' in dotted and any(len(part) > 1 and part.startswith('0') for part in dotted.split('.')):
+        return None
     try:
-        addr = ipaddress.ip_address(ip)
+        addr = ipaddress.ip_address(core)
     except ValueError:
-        return False
+        return None
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return addr
+
+def is_exposed_ip(addr):
+    """Only loopback and unspecified addresses are excluded; private, link-local, ULA,
+    multicast and documentation ranges are kept as infrastructure context."""
     return not (addr.is_loopback or addr.is_unspecified)
+
+def extract_ips(line):
+    """Returns the exposed IPv4 and IPv6 addresses in one line, in canonical form."""
+    ips = set()
+
+    def take_ipv6(match):
+        candidate = match.group(0)
+        core = candidate.split('%', 1)[0]
+        # Full form needs 8 groups (an embedded IPv4 tail counts as 2); shorter forms need '::'
+        if '::' not in core and core.count(':') + ('.' in core) != 7:
+            return candidate
+        addr = parse_ip(core)
+        if addr is None:
+            return candidate
+        if is_exposed_ip(addr):
+            ips.add(str(addr))
+        # Blank the valid IPv6 span so the IPv4 regex does not report its embedded IPv4 tail again
+        return ' ' * len(candidate)
+
+    if ':' in line:
+        line = REGEX_IPV6.sub(take_ipv6, line)
+    for candidate in REGEX_IPV4.findall(line):
+        addr = parse_ip(candidate)
+        if addr is not None and is_exposed_ip(addr):
+            ips.add(str(addr))
+    return ips
 
 def check_binary(binary_name):
     return shutil.which(binary_name) is not None
@@ -350,9 +400,7 @@ def scan_file(filepath, ctx):
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line_no, line in enumerate(f, 1):
-                for ip in REGEX_IP.findall(line):
-                    if is_exposed_ip(ip):
-                        findings['ips'].add(ip)
+                findings['ips'].update(extract_ips(line))
                 # Strip credentials in URLs (scheme://user:pass@host) so the password is not read as an email
                 for email in REGEX_EMAIL.findall(REGEX_URL_USERINFO.sub('://', line)):
                     findings['emails'].add(email)
@@ -413,7 +461,7 @@ def get_git_authors(repo_path, ctx):
         return [f"[!] Git is not installed or returned an error: {e}"]
 
 def main(directory, repo_name, timestamp, ctx):
-    print(f"\n=== SOC REPOSITORY TRIAGE SCANNER V1.9 ===")
+    print(f"\n=== SOC REPOSITORY TRIAGE SCANNER V1.10 ===")
     print(f"Target Directory: {directory}")
     print(f"Session ID: {repo_name}-{timestamp}\n")
 
@@ -470,7 +518,8 @@ def main(directory, repo_name, timestamp, ctx):
 
     print("\n[2] INFRASTRUCTURE EXPOSURE (IP ADDRESS):")
     if all_ips:
-        for ip in sorted(all_ips, key=ipaddress.ip_address):
+        # IPv4 first, then IPv6: addresses of different versions cannot be compared directly
+        for ip in sorted(all_ips, key=lambda a: (ipaddress.ip_address(a).version, ipaddress.ip_address(a))):
             print(f"  - {ip}")
     else:
         print("  - No exposed IP addresses found.")
@@ -611,7 +660,7 @@ def exit_code(ctx, fail_on_findings, strict):
     return EXIT_OK
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="SOC Triage Script for Leaked Repositories (Version 1.9)")
+    parser = argparse.ArgumentParser(description="SOC Triage Script for Leaked Repositories (Version 1.10)")
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("url", nargs="?", help="Repository URL (example: https://github.com/org/repo)")
     target.add_argument("--local", metavar="PATH", help="Scan a local folder in place, without cloning (any path)")

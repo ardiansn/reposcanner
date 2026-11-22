@@ -326,6 +326,26 @@ class ScannerCliTest(unittest.TestCase):
         gitleaks = json.loads(self.read_single(os.path.join(out, "gitleaks-report-*.json")))[0]
         self.assertEqual(gitleaks["Secret"], SYNTHETIC_SECRET_VALUE)
 
+    # v1.10: IPv4 + IPv6 detection
+    def test_mixed_ipv4_ipv6_scan_sorts_versions(self):
+        self.write_target(
+            "primary = 2001:db8::1\n"
+            "backup  = 10.0.0.5\n"
+            "mapped  = ::ffff:8.8.8.8\n"
+            "iface   = fe80::1%eth0\n"
+            "Server is 192.0.2.10.\n"
+            "local   = ::1 127.0.0.1\n",
+            name="hosts.conf",
+        )
+        out = os.path.join(self.tmp, "out")
+        result = self.run_scanner("--local", self.target, "--output-dir", out)
+        self.assert_exit(result, 0)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        log = self.read_single(os.path.join(out, "soc_repo_scanner-*.log"))
+        section = log.split("[2] INFRASTRUCTURE EXPOSURE (IP ADDRESS):", 1)[1].split("[3]", 1)[0]
+        reported = [line.strip()[2:] for line in section.splitlines() if line.strip().startswith("- ")]
+        self.assertEqual(reported, ["8.8.8.8", "10.0.0.5", "192.0.2.10", "2001:db8::1", "fe80::1"])
+
 
 class MaskingTest(unittest.TestCase):
     """Unit tests for the masking helpers."""
@@ -348,6 +368,52 @@ class MaskingTest(unittest.TestCase):
         span = (start, start + len(OTHER_SECRET_VALUE))
         masked = self.scanner.mask_spans(line, [span, (start + 2, span[1])])
         self.assertEqual(masked, "key=" + self.scanner.mask_secret(OTHER_SECRET_VALUE) + " end")
+
+
+class IpDetectionTest(unittest.TestCase):
+    """Unit tests for IPv4/IPv6 extraction and validation."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scanner = load_scanner_module()
+
+    def assert_ips(self, line, expected):
+        self.assertEqual(self.scanner.extract_ips(line), set(expected), repr(line))
+
+    def test_ipv6_full_compressed_ula_and_link_local_detected(self):
+        self.assert_ips("addr = 2001:0db8:85a3:0000:0000:8a2e:0370:7334", ["2001:db8:85a3::8a2e:370:7334"])
+        self.assert_ips("dns = 2001:db8::1", ["2001:db8::1"])
+        self.assert_ips("dns = 2606:4700:4700::1111", ["2606:4700:4700::1111"])
+        self.assert_ips("ula = fd00::1", ["fd00::1"])
+        self.assert_ips("ll = fe80::1", ["fe80::1"])
+        self.assert_ips("ll = [2001:db8::2]:443", ["2001:db8::2"])
+
+    def test_ipv6_zone_id_is_stripped(self):
+        self.assert_ips("ll = fe80::1%eth0", ["fe80::1"])
+        self.assert_ips("Bound to fe80::1%en0.", ["fe80::1"])
+
+    def test_loopback_and_unspecified_excluded(self):
+        for line in ("::1", "127.0.0.1", "127.8.9.10", "::", "0.0.0.0", "::ffff:127.0.0.1"):
+            self.assert_ips(line, [])
+
+    def test_invalid_and_non_ip_strings_rejected(self):
+        for line in ("999.999.999.999", "01.02.03.004", "010.0.0.1", "::ffff:010.0.0.1", "at 12:34:56", "2024-01-01T12:34:56Z", "mac aa:bb:cc:dd:ee:ff",
+                     "Foo::abc", "std::vector", "v1.2.3.4", "1.2.3.4.5", "oid 1.3.6.1.4.1",
+                     "1:2:3:4:5:6:7:8:9"):
+            self.assert_ips(line, [])
+
+    def test_ipv4_contexts_detected(self):
+        self.assert_ips("Server is 10.0.0.1.", ["10.0.0.1"])
+        self.assert_ips("url = http://10.0.0.1/api", ["10.0.0.1"])
+        self.assert_ips("HOST=10.0.0.1", ["10.0.0.1"])
+        self.assert_ips("host: 10.0.0.1:8080", ["10.0.0.1"])
+
+    def test_ipv4_mapped_ipv6_reported_once_as_ipv4(self):
+        self.assert_ips("mapped = ::ffff:8.8.8.8", ["8.8.8.8"])
+        self.assert_ips("::ffff:8.8.8.8 and 8.8.8.8", ["8.8.8.8"])
+
+    def test_mixed_versions_on_one_line(self):
+        self.assert_ips("ips: 10.0.0.1, fe80::2, 2001:db8::3", ["10.0.0.1", "fe80::2", "2001:db8::3"])
 
 
 if __name__ == "__main__":
