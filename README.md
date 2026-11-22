@@ -104,7 +104,7 @@ Other platforms: see the installation instructions of [Gitleaks](https://github.
 Get the scanner:
 
 ```bash
-git clone https://github.com/<your-account>/reposcanner.git
+git clone https://github.com/ardiansn/reposcanner.git
 cd reposcanner
 python3 soc_repo_scanner.py --help
 ```
